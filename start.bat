@@ -1,11 +1,11 @@
 @echo off
-title Fishing Bot
+title Fishing Bot - Ishlamoqda
 echo ====================================
 echo  Fishing Bot ishga tushmoqda...
 echo ====================================
 echo.
 
-:: Python borligini tekshiramiz
+:: Python tekshiruvi
 python --version >nul 2>&1
 if errorlevel 1 (
     echo [XATO] Python topilmadi!
@@ -14,7 +14,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-:: .env fayl borligini tekshiramiz
+:: .env tekshiruvi
 if not exist .env (
     echo [XATO] .env fayl topilmadi!
     echo Avval install.bat ni ishga tushiring.
@@ -25,16 +25,19 @@ if not exist .env (
 :: Token kiritilganligini tekshiramiz
 findstr /c:"YOUR_TELEGRAM_BOT_TOKEN_HERE" .env >nul 2>&1
 if not errorlevel 1 (
-    echo [XATO] .env fayliga hali token kiritilmagan!
-    echo BOT_TOKEN= ga tokeningizni yozing va saqlang.
+    echo [XATO] BOT_TOKEN hali kiritilmagan!
+    echo .env faylni oching va tokeningizni yozing.
     notepad .env
     pause
     exit /b 1
 )
 
-echo [OK] Barcha tekshiruvlar o'tdi.
+echo [OK] Sozlamalar topildi.
 echo.
-echo Bot ishlayapti... To'xtatish uchun Ctrl+C bosing.
+echo ============================================================
+echo  Bot ishlayapti!
+echo  To'xtatish uchun: Ctrl + C
+echo ============================================================
 echo.
 python main.py
 

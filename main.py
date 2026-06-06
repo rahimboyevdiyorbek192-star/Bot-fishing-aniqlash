@@ -2,8 +2,13 @@ import os
 import ssl
 import socket
 import sqlite3
+import base64
+import unicodedata
 import urllib.parse
 import datetime
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
 import requests
 import whois
 from dotenv import load_dotenv
@@ -11,28 +16,68 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 
 load_dotenv()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+VT_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
+ABUSEIPDB_KEY = os.getenv("ABUSEIPDB_API_KEY", "")
+PHISHTANK_KEY = os.getenv("PHISHTANK_API_KEY", "")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+executor = ThreadPoolExecutor(max_workers=10)
 
 DB_PATH = "stats.db"
 
-SUSPICIOUS_TLDS = {".xyz", ".top", ".click", ".tk", ".ml", ".ga", ".cf", ".gq", ".pw", ".cc", ".su", ".icu", ".live"}
+SUSPICIOUS_TLDS = {
+    ".xyz", ".top", ".click", ".tk", ".ml", ".ga", ".cf", ".gq",
+    ".pw", ".cc", ".su", ".icu", ".live", ".online", ".site", ".fun", ".space"
+}
 SUSPICIOUS_COUNTRIES = {"Russia", "China", "North Korea", "Iran", "Belarus"}
-SHORT_URL_DOMAINS = {"bit.ly", "t.co", "tinyurl.com", "goo.gl", "ow.ly", "short.link", "rebrand.ly", "cutt.ly", "clck.ru", "vk.cc"}
+SHORT_URL_DOMAINS = {
+    "bit.ly", "t.co", "tinyurl.com", "goo.gl", "ow.ly", "short.link",
+    "rebrand.ly", "cutt.ly", "clck.ru", "vk.cc"
+}
+SUSPICIOUS_KEYWORDS = {
+    "login", "verify", "secure", "account", "update", "confirm", "bank",
+    "payment", "signin", "password", "credential", "recover", "wallet",
+    "billing", "kirish", "tasdiqlash", "xavfsiz", "hisob", "karta"
+}
+UZBEK_BRANDS = {
+    "payme": "payme.uz",
+    "click": "click.uz",
+    "uzcard": "uzcard.uz",
+    "humo": "humo.uz",
+    "kapitalbank": "kapitalbank.uz",
+    "hamkorbank": "hamkorbank.uz",
+    "myuzcard": "myuzcard.uz",
+    "davrbank": "davrbank.uz",
+    "aloqabank": "aloqabank.uz",
+    "nbu": "nbu.uz",
+}
+GLOBAL_BRANDS = {
+    "google": "google.com",
+    "facebook": "facebook.com",
+    "instagram": "instagram.com",
+    "telegram": "telegram.org",
+    "paypal": "paypal.com",
+    "apple": "apple.com",
+    "microsoft": "microsoft.com",
+    "amazon": "amazon.com",
+    "netflix": "netflix.com",
+}
+ALL_BRANDS = {**UZBEK_BRANDS, **GLOBAL_BRANDS}
 
 
-# --- Ma'lumotlar bazasi ---
+# ── Ma'lumotlar bazasi ──────────────────────────────────────────────────────
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS stats (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            url       TEXT,
-            risk      INTEGER,
-            checked   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            url     TEXT,
+            risk    INTEGER,
+            checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
@@ -53,22 +98,29 @@ def get_stats() -> tuple[int, int]:
     return (row[0] or 0), (row[1] or 0)
 
 
-# --- Tahlil yordamchi funksiyalar ---
+# ── Tarmoq tekshiruvlari ────────────────────────────────────────────────────
 
-def expand_short_url(url: str) -> tuple[str, bool]:
-    """Qisqa havolani ochib, asl manzilni qaytaradi."""
+def get_redirect_chain(url: str) -> list[str]:
+    """Har bir yo'naltirish qadamini ko'rsatadi."""
+    chain = []
+    current = url
     try:
-        domain = urllib.parse.urlparse(url).netloc
-        if domain in SHORT_URL_DOMAINS:
-            resp = requests.head(url, allow_redirects=True, timeout=5)
-            if resp.url and resp.url != url:
-                return resp.url, True
+        for _ in range(10):
+            resp = requests.get(current, allow_redirects=False, timeout=5, stream=True)
+            chain.append(current)
+            if resp.is_redirect and resp.headers.get("Location"):
+                nxt = resp.headers["Location"]
+                if not nxt.startswith("http"):
+                    p = urllib.parse.urlparse(current)
+                    nxt = f"{p.scheme}://{p.netloc}{nxt}"
+                current = nxt
+            else:
+                break
     except Exception:
         pass
-    return url, False
+    return chain if chain else [url]
 
 def check_ssl(domain: str) -> dict:
-    """SSL sertifikat holati va muddatini tekshiradi."""
     try:
         ctx = ssl.create_default_context()
         with ctx.wrap_socket(socket.socket(), server_hostname=domain) as s:
@@ -87,27 +139,189 @@ def check_ssl(domain: str) -> dict:
         return {"valid": False, "days_left": 0, "issuer": "Noma'lum"}
 
 def check_whois(domain: str) -> dict:
-    """Domen yoshi va registratorini aniqlaydi."""
     try:
         w = whois.whois(domain)
         created = w.creation_date
         if isinstance(created, list):
             created = created[0]
         if created:
+            if isinstance(created, str):
+                created = datetime.datetime.fromisoformat(created)
             age = (datetime.datetime.utcnow() - created).days
             return {"age_days": age, "registrar": w.registrar or "Noma'lum"}
     except Exception:
         pass
     return {"age_days": None, "registrar": "Noma'lum"}
 
-def calculate_risk(domain: str, country: str, ssl_info: dict, whois_info: dict, redirected: bool) -> tuple[int, list[str]]:
+def _get_geo(ip: str) -> dict:
+    try:
+        return requests.get(f"http://ip-api.com/json/{ip}", timeout=5).json()
+    except Exception:
+        return {}
+
+def check_virustotal(url: str) -> dict:
+    if not VT_API_KEY:
+        return {"available": False}
+    try:
+        url_id = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+        headers = {"x-apikey": VT_API_KEY}
+        resp = requests.get(
+            f"https://www.virustotal.com/api/v3/urls/{url_id}",
+            headers=headers, timeout=10
+        )
+        if resp.status_code == 200:
+            stats = resp.json().get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
+            if stats:
+                return {
+                    "available": True,
+                    "malicious": stats.get("malicious", 0),
+                    "suspicious": stats.get("suspicious", 0),
+                    "total": sum(stats.values()),
+                }
+        # URL hali tahlil qilinmagan — topshiramiz
+        sub = requests.post(
+            "https://www.virustotal.com/api/v3/urls",
+            headers=headers, data={"url": url}, timeout=10
+        )
+        if sub.status_code == 200:
+            return {"available": True, "malicious": 0, "suspicious": 0, "total": 0, "pending": True}
+    except Exception:
+        pass
+    return {"available": False}
+
+def check_phishtank(url: str) -> dict:
+    try:
+        data = {"url": url, "format": "json"}
+        if PHISHTANK_KEY:
+            data["app_key"] = PHISHTANK_KEY
+        resp = requests.post(
+            "https://checkurl.phishtank.com/checkurl/",
+            data=data,
+            headers={"User-Agent": "phishtank/python"},
+            timeout=10
+        )
+        result = resp.json().get("results", {})
+        return {
+            "available": True,
+            "in_database": result.get("in_database", False),
+            "is_phishing": result.get("valid", False),
+        }
+    except Exception:
+        return {"available": False}
+
+def check_abuseipdb(ip: str) -> dict:
+    if not ABUSEIPDB_KEY or ip == "Noma'lum":
+        return {"available": False}
+    try:
+        resp = requests.get(
+            "https://api.abuseipdb.com/api/v2/check",
+            params={"ipAddress": ip, "maxAgeInDays": 90},
+            headers={"Key": ABUSEIPDB_KEY, "Accept": "application/json"},
+            timeout=8
+        ).json()
+        data = resp.get("data", {})
+        return {
+            "available": True,
+            "abuse_score": data.get("abuseConfidenceScore", 0),
+            "total_reports": data.get("totalReports", 0),
+        }
+    except Exception:
+        return {"available": False}
+
+
+# ── Heuristik tekshiruvlar ──────────────────────────────────────────────────
+
+def check_url_patterns(url: str, domain: str) -> list[str]:
+    warnings = []
+
+    # To'g'ridan IP manzil
+    try:
+        socket.inet_aton(domain)
+        warnings.append("⚠️ Domain o'rniga IP manzil ishlatilgan")
+    except socket.error:
+        pass
+
+    # @ belgisi — manzil yashirish hiylasi
+    if "@" in url:
+        warnings.append("⚠️ URL da `@` belgisi — asl manzil yashirilgan bo'lishi mumkin")
+
+    # Shubhali kalit so'zlar
+    found = [kw for kw in SUSPICIOUS_KEYWORDS if kw in url.lower()]
+    if found:
+        warnings.append(f"⚠️ Shubhali so'zlar URL da: `{', '.join(found[:4])}`")
+
+    # Haddan ko'p subdomen
+    parts = domain.split(".")
+    if len(parts) > 4:
+        warnings.append(f"⚠️ Ko'p subdomen: {len(parts) - 2} ta")
+
+    # Juda uzun URL
+    if len(url) > 150:
+        warnings.append(f"⚠️ URL juda uzun: {len(url)} ta belgi")
+
+    # Ko'p chiziqcha
+    if domain.count("-") >= 2:
+        warnings.append("⚠️ Domenda ko'p `-` — phishing belgisi")
+
+    return warnings
+
+def check_brand_impersonation(domain: str) -> list[str]:
+    warnings = []
+    dl = domain.lower()
+    for brand, official in ALL_BRANDS.items():
+        if brand in dl and dl != official and not dl.endswith("." + official):
+            tag = "🇺🇿" if brand in UZBEK_BRANDS else "🌐"
+            warnings.append(f"⚠️ {tag} `{brand}` brendini taqlid qilishi mumkin! Rasmiy: `{official}`")
+    return warnings
+
+def check_homograph(domain: str) -> list[str]:
+    found = []
+    for ch in domain:
+        if ch in ".-0123456789":
+            continue
+        name = unicodedata.name(ch, "")
+        if any(s in name for s in ("CYRILLIC", "GREEK", "ARABIC", "ARMENIAN")):
+            found.append(ch)
+    if found:
+        return [f"⚠️ Homograf hujum! Unicode harflar aniqlandi: `{''.join(set(found))}`"]
+    return []
+
+
+# ── Xavf hisoblash ──────────────────────────────────────────────────────────
+
+def calculate_risk(
+    domain: str, country: str,
+    ssl_info: dict, whois_info: dict, redirected: bool,
+    vt: dict, phishtank: dict, abuse: dict,
+    pattern_w: list, brand_w: list, homograph_w: list,
+) -> tuple[int, list[str]]:
     score = 0
     reasons = []
+
+    if vt.get("available") and not vt.get("pending") and vt.get("malicious", 0) > 0:
+        score += min(vt["malicious"] * 5, 40)
+        reasons.append(f"🔴 VirusTotal: {vt['malicious']}/{vt['total']} engine xavfli dedi")
+
+    if phishtank.get("is_phishing"):
+        score += 40
+        reasons.append("🔴 PhishTank: tasdiqlangan phishing sayt!")
+
+    if abuse.get("available") and abuse.get("abuse_score", 0) > 25:
+        score += min(abuse["abuse_score"] // 4, 20)
+        reasons.append(f"🔴 AbuseIPDB: {abuse['abuse_score']}/100 ({abuse.get('total_reports', 0)} shikoyat)")
+
+    if homograph_w:
+        score += 35
+        reasons.extend(homograph_w)
+
+    if brand_w:
+        score += 25
+        reasons.extend(brand_w)
 
     tld = "." + domain.split(".")[-1].lower()
     if tld in SUSPICIOUS_TLDS:
         score += 15
-        reasons.append(f"⚠️ Shubhali domen kengaytmasi: `{tld}`")
+        reasons.append(f"⚠️ Shubhali kengaytma: `{tld}`")
 
     if country in SUSPICIOUS_COUNTRIES:
         score += 20
@@ -118,20 +332,24 @@ def calculate_risk(domain: str, country: str, ssl_info: dict, whois_info: dict, 
         reasons.append("⚠️ SSL sertifikat yo'q yoki yaroqsiz")
     elif ssl_info["days_left"] < 30:
         score += 10
-        reasons.append(f"⚠️ SSL sertifikat {ssl_info['days_left']} kun ichida tugaydi")
+        reasons.append(f"⚠️ SSL {ssl_info['days_left']} kun ichida tugaydi")
 
-    age = whois_info["age_days"]
+    age = whois_info.get("age_days")
     if age is not None:
         if age < 180:
             score += 30
-            reasons.append(f"⚠️ Domen yaqinda ro'yxatdan o'tgan ({age} kun avval)")
+            reasons.append(f"⚠️ Domen {age} kun oldin ro'yxatdan o'tgan — juda yangi")
         elif age < 365:
             score += 15
-            reasons.append(f"⚠️ Domen nisbatan yangi ({age} kun avval)")
+            reasons.append(f"⚠️ Domen nisbatan yangi ({age} kun)")
 
     if redirected:
         score += 10
-        reasons.append("⚠️ Qisqa havola — asl manzil yashirilgan edi")
+        reasons.append("⚠️ Yashirin yo'naltirish aniqlandi")
+
+    if pattern_w:
+        score += min(len(pattern_w) * 8, 25)
+        reasons.extend(pattern_w)
 
     return min(score, 100), reasons
 
@@ -153,99 +371,170 @@ def format_age(days: int | None) -> str:
     return f"{days} kun"
 
 
-# --- Asosiy tahlil funksiyasi ---
+# ── Asosiy tahlil (parallel) ────────────────────────────────────────────────
 
-def analyze_url(url: str) -> tuple[str, int]:
+async def analyze_url(url: str) -> tuple[str, int]:
+    loop = asyncio.get_event_loop()
+
     try:
-        expanded_url, redirected = expand_short_url(url)
+        # 1. Yo'naltirish zanjiri
+        chain = await loop.run_in_executor(executor, get_redirect_chain, url)
+        final_url = chain[-1] if chain else url
+        redirected = len(chain) > 1
 
-        parsed = urllib.parse.urlparse(expanded_url)
+        parsed = urllib.parse.urlparse(final_url)
         domain = (parsed.netloc or parsed.path).split(":")[0]
+        if "@" in domain:
+            domain = domain.split("@")[-1]
         if not domain:
             return None, 0
 
-        ip = socket.gethostbyname(domain)
-        geo = requests.get(f"http://ip-api.com/json/{ip}", timeout=5).json()
-        country = geo.get("country", "Noma'lum")
-        isp = geo.get("isp", "Noma'lum")
-        org = geo.get("org", "Noma'lum")
+        # 2. Tezkor heuristikalar (tarmoqsiz)
+        pattern_w = check_url_patterns(final_url, domain)
+        brand_w = check_brand_impersonation(domain)
+        homograph_w = check_homograph(domain)
 
-        ssl_info = check_ssl(domain)
-        whois_info = check_whois(domain)
-        score, reasons = calculate_risk(domain, country, ssl_info, whois_info, redirected)
+        # 3. DNS
+        try:
+            ip = await loop.run_in_executor(executor, socket.gethostbyname, domain)
+        except Exception:
+            ip = "Noma'lum"
+
+        # 4. Barcha tarmoq tekshiruvlari PARALLEL
+        results = await asyncio.gather(
+            loop.run_in_executor(executor, _get_geo, ip),
+            loop.run_in_executor(executor, check_ssl, domain),
+            loop.run_in_executor(executor, check_whois, domain),
+            loop.run_in_executor(executor, check_virustotal, final_url),
+            loop.run_in_executor(executor, check_phishtank, final_url),
+            loop.run_in_executor(executor, check_abuseipdb, ip),
+            return_exceptions=True,
+        )
+
+        def safe(r, default):
+            return r if not isinstance(r, Exception) else default
+
+        geo        = safe(results[0], {})
+        ssl_info   = safe(results[1], {"valid": False, "days_left": 0, "issuer": "Noma'lum"})
+        whois_info = safe(results[2], {"age_days": None, "registrar": "Noma'lum"})
+        vt         = safe(results[3], {"available": False})
+        phishtank  = safe(results[4], {"available": False})
+        abuse      = safe(results[5], {"available": False})
+
+        country = geo.get("country", "Noma'lum")
+        isp     = geo.get("isp", "Noma'lum")
+        org     = geo.get("org", "Noma'lum")
+
+        score, reasons = calculate_risk(
+            domain, country, ssl_info, whois_info, redirected,
+            vt, phishtank, abuse, pattern_w, brand_w, homograph_w
+        )
         label = risk_label(score)
 
+        # ── Formatlash ──
         ssl_str = (
-            f"✅ Ha ({ssl_info['days_left']} kun qoldi · {ssl_info['issuer']})"
+            f"✅ Ha ({ssl_info['days_left']} kun · {ssl_info['issuer']})"
             if ssl_info["valid"] else "❌ Yo'q"
         )
-        redirect_str = f"🔀 Ha → `{expanded_url}`" if redirected else "✅ Yo'q"
+
+        if redirected and len(chain) > 1:
+            chain_lines = "\n🔗 *Yo'naltirish zanjiri:*\n"
+            for i, hop in enumerate(chain[:6]):
+                prefix = "└→" if i == len(chain) - 1 else "├→"
+                chain_lines += f"  {prefix} `{hop[:80]}`\n"
+        else:
+            chain_lines = "🔗 *Yo'naltirish:* Yo'q"
+
+        if vt.get("available"):
+            if vt.get("pending"):
+                vt_str = "⏳ Yangi havola — tahlil topshirildi"
+            else:
+                icon = "🔴" if vt["malicious"] > 0 else "🟢"
+                vt_str = f"{icon} {vt['malicious']}/{vt['total']} engine xavfli dedi"
+        else:
+            vt_str = "⚪ API kalit yo'q"
+
+        if phishtank.get("available"):
+            if phishtank.get("is_phishing"):
+                pt_str = "🔴 Tasdiqlangan phishing sayt!"
+            elif phishtank.get("in_database"):
+                pt_str = "🟡 Bazada bor, tasdiqlanmagan"
+            else:
+                pt_str = "🟢 Phishing bazasida yo'q"
+        else:
+            pt_str = "⚪ Tekshirib bo'lmadi"
+
+        if abuse.get("available"):
+            s = abuse.get("abuse_score", 0)
+            icon = "🔴" if s > 50 else "🟡" if s > 25 else "🟢"
+            abuse_str = f"{icon} {s}/100 ({abuse.get('total_reports', 0)} shikoyat)"
+        else:
+            abuse_str = "⚪ API kalit yo'q"
 
         report = (
-            f"🔍 **Havola tahlili:**\n"
-            f"🌐 **Domen:** `{domain}`\n"
-            f"📌 **IP Manzil:** `{ip}`\n"
-            f"🌍 **Server joylashuvi:** {country}\n"
-            f"🏢 **Hosting:** {isp}\n"
-            f"🔒 **Tashkilot:** {org}\n"
-            f"🛡 **SSL sertifikat:** {ssl_str}\n"
-            f"📅 **Domen yoshi:** {format_age(whois_info['age_days'])} · {whois_info['registrar']}\n"
-            f"🔗 **Yo'naltirish:** {redirect_str}\n"
-            f"\n📊 **Xavf darajasi: {score}/100 — {label}**\n"
+            f"🔍 *Havola tahlili:*\n"
+            f"🌐 *Domen:* `{domain}`\n"
+            f"📌 *IP:* `{ip}` · {country}\n"
+            f"🏢 *Hosting:* {isp}\n"
+            f"🔒 *Tashkilot:* {org}\n"
+            f"🛡 *SSL:* {ssl_str}\n"
+            f"📅 *Domen yoshi:* {format_age(whois_info.get('age_days'))} · {whois_info.get('registrar', 'Noma\\'lum')}\n"
+            f"{chain_lines}\n\n"
+            f"*🔬 Threat Intelligence:*\n"
+            f"🦠 *VirusTotal:* {vt_str}\n"
+            f"🎣 *PhishTank:* {pt_str}\n"
+            f"🚨 *AbuseIPDB:* {abuse_str}\n\n"
+            f"📊 *Xavf darajasi: {score}/100 — {label}*"
         )
 
         if reasons:
-            report += "\n**Ogohlantirish sabablari:**\n" + "\n".join(reasons)
+            reasons_block = "\n\n*⚠️ Topilgan muammolar:*\n" + "\n".join(reasons[:8])
+            if len(report) + len(reasons_block) < 4000:
+                report += reasons_block
 
         return report, score
 
     except Exception:
-        return (
-            f"🌐 **Domen:** `{url}`\n"
-            f"❌ *Ma'lumot olib bo'lmadi yoki domen bloklangan.*"
-        ), 0
+        return f"🌐 *Havola:* `{url}`\n❌ Tahlil qilib bo'lmadi.", 0
 
 
-# --- Botning komanda handlerlari ---
+# ── Komanda handlerlari ─────────────────────────────────────────────────────
 
 @dp.message(Command("start", "help"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "🛡 **Fishing Aniqlagich Bot**\n\n"
-        "Bu bot Telegram xabarlaridagi havolalarni tekshirib, "
-        "ular xavfli yoki xavfsizligini aniqlaydi.\n\n"
-        "**Qanday foydalanish:**\n"
-        "• Shubhali xabarni menga *forward* qiling\n"
-        "• Yoki to'g'ridan-to'g'ri havola yuboring\n"
-        "• Bot avtomatik tahlil qilib natija beradi\n\n"
-        "**Bot nima tekshiradi?**\n"
-        "🌍 Server joylashuvi va hosting\n"
+        "🛡 *Fishing Aniqlagich Bot*\n\n"
+        "Telegram xabarlaridagi havolalarni professional darajada tahlil qiladi.\n\n"
+        "*Bot nima tekshiradi?*\n"
+        "🦠 VirusTotal — 70+ antivirus bazasi\n"
+        "🎣 PhishTank — tasdiqlangan phishing bazasi\n"
+        "🚨 AbuseIPDB — spam/hujum IP bazasi\n"
         "🛡 SSL sertifikat holati va muddati\n"
-        "📅 Domen yoshi — yangi domenlar ko'proq xavfli\n"
-        "🔗 Qisqa havolalarning asl manzili\n"
-        "📊 Umumiy xavf darajasi (0–100 ball)\n\n"
-        "**Buyruqlar:**\n"
-        "/start — Bosh sahifa\n"
-        "/stats — Statistika\n\n"
-        "⚠️ Xavf darajasi yuqori bo'lsa, o'sha havolaga "
-        "hech qachon karta yoki shaxsiy ma'lumot kiritmang!",
+        "📅 Domen yoshi (WHOIS)\n"
+        "🔗 Yo'naltirish zanjiri (har bir qadam)\n"
+        "🔤 Homograf hujum aniqlash\n"
+        "🇺🇿 O'zbek brendlari taqlidi aniqlash\n"
+        "📊 0–100 ballik xavf tizimi\n\n"
+        "*Foydalanish:*\n"
+        "Shubhali xabarni menga *forward* qiling yoki havola yuboring.\n\n"
+        "*Buyruqlar:*\n"
+        "/stats — Statistika",
         parse_mode="Markdown",
     )
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message):
     total, dangerous = get_stats()
-    safe = total - dangerous
     await message.answer(
-        f"📊 **Bot statistikasi:**\n\n"
-        f"🔍 Jami tekshirilgan: **{total}** ta havola\n"
-        f"🔴 Xavfli (≥50 ball): **{dangerous}** ta\n"
-        f"🟢 Xavfsiz (<50 ball): **{safe}** ta",
+        f"📊 *Bot statistikasi:*\n\n"
+        f"🔍 Jami tekshirilgan: *{total}* ta\n"
+        f"🔴 Xavfli (≥50 ball): *{dangerous}* ta\n"
+        f"🟢 Xavfsiz (<50 ball): *{total - dangerous}* ta",
         parse_mode="Markdown",
     )
 
 
-# --- Asosiy xabar handleri ---
+# ── Asosiy xabar handleri ───────────────────────────────────────────────────
 
 @dp.message()
 async def handle_message(message: types.Message):
@@ -253,8 +542,7 @@ async def handle_message(message: types.Message):
 
     text = message.text or message.caption or ""
 
-    entities = message.entities or message.caption_entities or []
-    for entity in entities:
+    for entity in (message.entities or message.caption_entities or []):
         if entity.type == "url":
             url = text[entity.offset : entity.offset + entity.length]
             if not url.startswith(("http://", "https://")):
@@ -265,31 +553,34 @@ async def handle_message(message: types.Message):
 
     if message.reply_markup and hasattr(message.reply_markup, "inline_keyboard"):
         for row in message.reply_markup.inline_keyboard:
-            for button in row:
-                if button.url:
-                    urls_to_check.add(button.url)
+            for btn in row:
+                if btn.url:
+                    urls_to_check.add(btn.url)
 
     if not urls_to_check:
-        await message.reply(
-            "⚠️ Ushbu xabarda hech qanday havola yoki yashirin tugma topilmadi."
-        )
+        await message.reply("⚠️ Ushbu xabarda hech qanday havola yoki yashirin tugma topilmadi.")
         return
 
-    await message.reply("⏳ Havolalar tahlil qilinmoqda, biroz kuting...")
-
-    final_response = "🚨 **Kiberxavfsizlik tahlil hisoboti:**\n\n"
-    for url in urls_to_check:
-        result, score = analyze_url(url)
-        if result:
-            save_stat(url, score)
-            final_response += result + "\n" + "—" * 22 + "\n"
-
-    final_response += (
-        "\n⚠️ **Eslatma:** Xavf darajasi 50 dan yuqori bo'lsa, "
-        "u havolaga plastik karta yoki shaxsiy ma'lumotlaringizni MUTLAQO kiritmang!"
+    await message.reply(
+        f"⏳ *{len(urls_to_check)} ta havola tahlil qilinmoqda...*\n"
+        f"_(VirusTotal, PhishTank, AbuseIPDB, SSL, WHOIS parallel tekshirilmoqda)_",
+        parse_mode="Markdown",
     )
 
-    await message.reply(final_response, parse_mode="Markdown")
+    for url in urls_to_check:
+        result, score = await analyze_url(url)
+        if result:
+            save_stat(url, score)
+            text_out = (
+                "🚨 *Kiberxavfsizlik tahlil hisoboti:*\n\n"
+                + result
+                + "\n\n" + "—" * 22 + "\n"
+                "⚠️ _Xavf darajasi 50+ bo'lsa karta yoki parol kiritmang!_"
+            )
+            try:
+                await message.reply(text_out, parse_mode="Markdown")
+            except Exception:
+                await message.reply(text_out)
 
 
 if __name__ == "__main__":

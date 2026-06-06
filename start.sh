@@ -17,13 +17,15 @@ if [ ! -f .env ]; then
 fi
 
 if grep -q "YOUR_TELEGRAM_BOT_TOKEN_HERE" .env; then
-    echo "[XATO] .env fayliga hali token kiritilmagan!"
-    echo "BOT_TOKEN= ga tokeningizni yozing."
+    echo "[XATO] BOT_TOKEN hali kiritilmagan!"
+    echo ".env faylni oching va tokeningizni yozing."
     exit 1
 fi
 
-echo "[OK] Barcha tekshiruvlar o'tdi."
+echo "[OK] Sozlamalar topildi."
 echo
-echo "Bot ishlayapti... To'xtatish uchun Ctrl+C bosing."
+echo "============================================================"
+echo " Bot ishlayapti! To'xtatish uchun: Ctrl + C"
+echo "============================================================"
 echo
 python3 main.py

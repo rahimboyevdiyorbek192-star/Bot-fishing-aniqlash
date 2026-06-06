@@ -13,15 +13,22 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-
-echo [OK] Python topildi.
+echo [OK] Python topildi:
+python --version
 echo.
 
 :: .env fayl borligini tekshiramiz
 if not exist .env (
     copy .env.example .env >nul
     echo [!] .env fayl yaratildi.
-    echo [!] Iltimos .env faylni oching va BOT_TOKEN ga o'z tokeningizni yozing.
+    echo.
+    echo ============================================================
+    echo  Muhim: .env faylini oching va quyidagilarni to'ldiring:
+    echo.
+    echo  BOT_TOKEN      - @BotFather dan oling (majburiy)
+    echo  VIRUSTOTAL_API_KEY - virustotal.com dan bepul (tavsiya)
+    echo  ABUSEIPDB_API_KEY  - abuseipdb.com dan bepul (tavsiya)
+    echo ============================================================
     echo.
     notepad .env
 ) else (
@@ -30,6 +37,7 @@ if not exist .env (
 
 echo.
 echo [*] Kutubxonalar o'rnatilmoqda...
+echo.
 pip install -r requirements.txt
 
 echo.
