@@ -14,15 +14,27 @@ import whois
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-VT_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
-ABUSEIPDB_KEY = os.getenv("ABUSEIPDB_API_KEY", "")
+BOT_TOKEN        = os.getenv("BOT_TOKEN")
+VT_API_KEY       = os.getenv("VIRUSTOTAL_API_KEY", "")
+ABUSEIPDB_KEY    = os.getenv("ABUSEIPDB_API_KEY", "")
+TG_API_ID        = int(os.getenv("TELETHON_API_ID", "0"))
+TG_API_HASH      = os.getenv("TELETHON_API_HASH", "")
+TG_SESSION       = os.getenv("TELETHON_SESSION", "")
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp  = Dispatcher()
+
+# Userbot — mavjud bo'lsa ulanadi
+userbot: TelegramClient | None = None
+if TG_API_ID and TG_API_HASH and TG_SESSION:
+    userbot = TelegramClient(
+        StringSession(TG_SESSION), TG_API_ID, TG_API_HASH
+    )
 executor = ThreadPoolExecutor(max_workers=10)
 
 DB_PATH = "stats.db"
@@ -233,6 +245,62 @@ def check_abuseipdb(ip: str) -> dict:
         }
     except Exception:
         return {"available": False}
+
+async def probe_telegram_bot(username: str) -> dict:
+    """Userbot orqali shubhali botga /start yuborib, javobidagi havolalarni oladi."""
+    if not userbot:
+        return {"available": False}
+    try:
+        entity = await userbot.get_entity(username)
+
+        # /start yuboramiz
+        await userbot.send_message(entity, "/start")
+
+        # 5 sekund javob kutamiz
+        await asyncio.sleep(5)
+
+        # Bot yuborgan so'nggi xabarlarni olamiz
+        messages = await userbot.get_messages(entity, limit=8)
+
+        urls: set[str] = set()
+        texts: list[str] = []
+
+        for msg in messages:
+            if msg.out:           # o'zimiz yuborganimizni o'tkazib yuboramiz
+                continue
+            if msg.text:
+                texts.append(msg.text[:300])
+
+            # Matn entities dan URL lar
+            if msg.entities:
+                for ent in msg.entities:
+                    if hasattr(ent, "url") and ent.url:
+                        urls.add(ent.url)
+                    elif hasattr(ent, "offset") and msg.text:
+                        try:
+                            chunk = msg.text[ent.offset : ent.offset + ent.length]
+                            if chunk.startswith("http"):
+                                urls.add(chunk)
+                        except Exception:
+                            pass
+
+            # Inline tugma havolalari
+            if msg.buttons:
+                for row in msg.buttons:
+                    if not isinstance(row, (list, tuple)):
+                        row = [row]
+                    for btn in row:
+                        if hasattr(btn, "url") and btn.url:
+                            urls.add(btn.url)
+
+        return {
+            "available": True,
+            "urls": list(urls),
+            "msg_count": len([m for m in messages if not m.out]),
+            "sample_text": texts[0][:200] if texts else "",
+        }
+    except Exception as e:
+        return {"available": False, "error": str(e)[:150]}
 
 async def check_with_browser(url: str) -> dict:
     """Headless Chromium orqali URL ni ochib, haqiqiy manzil va sahifa ma'lumotlarini oladi."""
@@ -615,6 +683,15 @@ async def analyze_url(url: str, context_w: list = None) -> tuple[str, int]:
         elif tg_channel.get("is_private_invite"):
             tg_channel_w.append("⚠️ Yopiq Telegram kanal taklifi — kim ekanligini ko'rib bo'lmaydi")
 
+        # 2b. Userbot orqali botni tekshirish (faqat aktiv bot/kanal uchun)
+        probe = {"available": False}
+        probe_urls: list[str] = []
+        if is_telegram_link and userbot and not tg_channel.get("is_private_invite") and not tg_channel.get("deleted"):
+            tg_path = urllib.parse.urlparse(final_url).path.strip("/").split("?")[0]
+            if tg_path and not tg_path.startswith("+"):
+                probe = await probe_telegram_bot(tg_path)
+                probe_urls = probe.get("urls", [])
+
         # 3. DNS
         try:
             ip = await loop.run_in_executor(executor, socket.gethostbyname, domain)
@@ -743,6 +820,26 @@ async def analyze_url(url: str, context_w: list = None) -> tuple[str, int]:
         else:
             tg_block = ""
 
+        # Userbot probe natijasi bloki
+        probe_block = ""
+        if probe.get("available"):
+            msg_count = probe.get("msg_count", 0)
+            sample = probe.get("sample_text", "")
+            if probe_urls:
+                urls_list = "\n".join(f"  🔗 `{u[:80]}`" for u in probe_urls[:5])
+                probe_block = (
+                    f"\n🤖 *Userbot tekshiruvi ({msg_count} ta javob):*\n"
+                    f"📨 *Bot matni:* {sample[:100]}\n"
+                    f"🔗 *Topilgan havolalar:*\n{urls_list}\n"
+                )
+            else:
+                probe_block = (
+                    f"\n🤖 *Userbot tekshiruvi:* {msg_count} ta javob\n"
+                    f"📨 *Bot matni:* {sample[:100] if sample else 'Havola topilmadi'}\n"
+                )
+        elif userbot and is_telegram_link and not tg_channel.get("deleted"):
+            probe_block = "\n🤖 *Userbot:* Botga ulanib bo'lmadi\n"
+
         if vt.get("available"):
             if vt.get("pending"):
                 vt_str = "⏳ Yangi havola — tahlil topshirildi"
@@ -822,6 +919,7 @@ async def analyze_url(url: str, context_w: list = None) -> tuple[str, int]:
             f"{whois_info.get('registrar', 'Noma''lum')}\n"
             f"{chain_lines}"
             f"{tg_block}"
+            f"{probe_block}"
             f"{browser_block}\n"
             f"*🔬 Threat Intelligence:*\n"
             f"🦠 *VirusTotal:* {vt_str}\n"
@@ -835,10 +933,12 @@ async def analyze_url(url: str, context_w: list = None) -> tuple[str, int]:
             if len(report) + len(reasons_block) < 4000:
                 report += reasons_block
 
-        return report, score
+        # Probe topgan URL larni extra_urls sifatida qaytaramiz
+        return report, score, probe_urls
+
 
     except Exception:
-        return f"🌐 *Havola:* `{url}`\n❌ Tahlil qilib bo'lmadi.", 0
+        return f"🌐 *Havola:* `{url}`\n❌ Tahlil qilib bo'lmadi.", 0, []
 
 
 # ── Komanda handlerlari ─────────────────────────────────────────────────────
@@ -927,7 +1027,7 @@ async def handle_message(message: types.Message):
     )
 
     for url in urls_to_check:
-        result, score = await analyze_url(url, context_w=context_w)
+        result, score, probe_urls = await analyze_url(url, context_w=context_w)
         if result:
             save_stat(url, score)
             text_out = (
@@ -941,8 +1041,40 @@ async def handle_message(message: types.Message):
             except Exception:
                 await message.reply(text_out)
 
+        # Userbot topgan havolalarni alohida tahlil qilamiz
+        if probe_urls:
+            await message.reply(
+                f"🤖 *Userbot {len(probe_urls)} ta yashirin havola topdi — tahlil boshlanmoqda...*",
+                parse_mode="Markdown",
+            )
+            seen_probe = set()
+            for probe_url in probe_urls[:5]:
+                if probe_url in urls_to_check or probe_url in seen_probe:
+                    continue
+                seen_probe.add(probe_url)
+                p_result, p_score, _ = await analyze_url(probe_url)
+                if p_result:
+                    save_stat(probe_url, p_score)
+                    p_out = (
+                        "🤖 *Userbot topgan havola tahlili:*\n\n"
+                        + p_result
+                        + "\n\n" + "—" * 22 + "\n"
+                        "⚠️ _Bot tugmasidagi havola — ayniqsa ehtiyot bo'ling!_"
+                    )
+                    try:
+                        await message.reply(p_out, parse_mode="Markdown")
+                    except Exception:
+                        await message.reply(p_out)
+
+
+async def main():
+    init_db()
+    if userbot:
+        await userbot.start()
+        print("Userbot ulandi.")
+    print("Bot ishga tushdi...")
+    await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
-    init_db()
-    print("Bot ishga tushdi...")
-    dp.run_polling(bot)
+    asyncio.run(main())
