@@ -336,7 +336,6 @@ async def check_telegram_channel(url: str) -> dict:
         title = chat.title or getattr(chat, "full_name", "") or ""
         description = chat.description or ""
 
-        # Kanal nomida brend taqlid tekshiruvi
         title_lower = title.lower().replace(" ", "").replace("_", "").replace("-", "")
         title_homograph = any(
             any(s in unicodedata.name(ch, "") for s in ("CYRILLIC", "GREEK"))
@@ -351,9 +350,9 @@ async def check_telegram_channel(url: str) -> dict:
 
         return {
             "found": True,
+            "username": chat.username or username,
             "chat_type": chat.type,
             "title": title,
-            "username": chat.username or username,
             "verified": getattr(chat, "is_verified", False),
             "member_count": getattr(chat, "member_count", None),
             "description": description[:200],
@@ -361,7 +360,9 @@ async def check_telegram_channel(url: str) -> dict:
             "title_has_homograph": title_homograph,
         }
     except Exception:
-        return {"found": False}
+        # Bot/kanal topilmadi — o'chirilgan yoki maxfiy
+        # Bu o'zi katta ogohlantirish: spam yuborib o'chirib ketishgan
+        return {"found": False, "username": username, "deleted": True}
 
 def check_message_context(message: types.Message) -> list[str]:
     """Xabar tuzilmasidan fishing belgilarini topadi (forward, tugma matnlari)."""
@@ -447,9 +448,11 @@ def calculate_risk(
         score += 25
         reasons.extend(brand_w)
 
-    # Telegram havola ichida brend taqlid
+    # Telegram havola: brend taqlid yoki o'chirilgan kanal
     if tg_url_w:
-        score += 30
+        # O'chirilgan kanal — juda kuchli belgi
+        deleted = any("O'CHIRILGAN" in w for w in tg_url_w)
+        score += 45 if deleted else 30
         reasons.extend(tg_url_w)
 
     # Xabar konteksti: forward, tugma matni
@@ -544,18 +547,22 @@ async def analyze_url(url: str, context_w: list = None) -> tuple[str, int]:
         tg_channel_w = []
         if tg_channel.get("found"):
             ch_title = tg_channel.get("title", "")
-            # Tasdiqlangan emas + brendni taqlid qiladi
             if tg_channel.get("brand_in_title") and not tg_channel.get("verified"):
                 for brand in tg_channel["brand_in_title"]:
                     tag = "🇺🇿" if brand in UZBEK_BRANDS else "🌐"
                     tg_channel_w.append(
                         f"🔴 {tag} Kanal `{brand}` brendini taqlid qiladi lekin TASDIQLANMAGAN!"
                     )
-            # Kanal nomida kirill/unicode harflar
             if tg_channel.get("title_has_homograph"):
                 tg_channel_w.append(
                     f"🔴 Kanal nomida unicode harflar — homograf hujum: `{ch_title}`"
                 )
+        elif tg_channel.get("deleted"):
+            # Kanal o'chirilgan — fishing yuborib ketishgan
+            uname = tg_channel.get("username", "")
+            tg_channel_w.append(
+                f"🔴 @{uname} — bot/kanal O'CHIRILGAN! Spam yuborib ketishgan — klassik fishing belgisi"
+            )
         elif tg_channel.get("is_private_invite"):
             tg_channel_w.append("⚠️ Yopiq Telegram kanal taklifi — kim ekanligini ko'rib bo'lmaydi")
 
@@ -625,10 +632,18 @@ async def analyze_url(url: str, context_w: list = None) -> tuple[str, int]:
                 f"✅ *Tasdiqlangan:* {verified_str}\n"
                 f"👥 *A'zolar:* {members_str}\n"
             )
+        elif tg_channel.get("deleted"):
+            uname = tg_channel.get("username", "")
+            tg_block = (
+                f"\n📱 *Telegram kanal ma'lumoti:*\n"
+                f"🔖 *Username:* @{uname}\n"
+                f"🗑 *Holat:* O'CHIRILGAN — spam yuborib o'chirib ketishgan\n"
+            )
         elif tg_channel.get("is_private_invite"):
-            tg_block = "\n📱 *Telegram:* Yopiq kanal taklifi\n"
+            tg_block = "\n📱 *Telegram:* Yopiq kanal taklifi — kirish mumkin emas\n"
         elif is_telegram_link:
-            tg_block = "\n📱 *Telegram:* Kanal topilmadi\n"
+            path = urllib.parse.urlparse(final_url).path.strip("/").split("?")[0]
+            tg_block = f"\n📱 *Telegram:* `@{path}` — ma'lumot olishning imkoni yo'q\n"
         else:
             tg_block = ""
 
