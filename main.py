@@ -41,6 +41,13 @@ SUSPICIOUS_KEYWORDS = {
     "payment", "signin", "password", "credential", "recover", "wallet",
     "billing", "kirish", "tasdiqlash", "xavfsiz", "hisob", "karta"
 }
+# Telegram ichidagi ijtimoiy muhandislik so'zlari
+SCAM_BUTTON_WORDS = {
+    "bonus", "sovg'a", "yutdi", "prize", "olish", "win", "gift",
+    "бонус", "приз", "получить", "награда", "free", "tekin", "bepul",
+    "yutuq", "lotereya", "lottery", "jackpot", "cash", "money"
+}
+TELEGRAM_DOMAINS = {"t.me", "telegram.me", "telegram.dog"}
 UZBEK_BRANDS = {
     "payme": "payme.uz",
     "click": "click.uz",
@@ -285,6 +292,72 @@ def check_homograph(domain: str) -> list[str]:
         return [f"⚠️ Homograf hujum! Unicode harflar aniqlandi: `{''.join(set(found))}`"]
     return []
 
+def check_telegram_url(url: str) -> list[str]:
+    """t.me/username — path ichida brend taqlid borligini tekshiradi."""
+    warnings = []
+    parsed = urllib.parse.urlparse(url)
+    if parsed.netloc not in TELEGRAM_DOMAINS:
+        return warnings
+    path = parsed.path.strip("/").lower().replace("_", "").replace("-", "")
+    if not path or path.startswith("+"):
+        # t.me/+xxx — yopiq kanal invite havolasi, shubhali
+        if path.startswith("+"):
+            warnings.append("⚠️ Yopiq Telegram kanal taklifi — ehtiyot bo'ling")
+        return warnings
+    for brand in ALL_BRANDS:
+        brand_clean = brand.replace("_", "").replace("-", "")
+        if brand_clean in path:
+            tag = "🇺🇿" if brand in UZBEK_BRANDS else "🌐"
+            warnings.append(
+                f"⚠️ {tag} Telegram havola `{brand}` brendini taqlid qilishi mumkin: `t.me/{parsed.path.strip('/')}`"
+            )
+    return warnings
+
+def check_message_context(message: types.Message) -> list[str]:
+    """Xabar tuzilmasidan fishing belgilarini topadi (forward, tugma matnlari)."""
+    warnings = []
+
+    # Forward tekshiruvi
+    if message.forward_date:
+        # @PostBot orqali forward — asl manbani yashirish uchun ishlatiladi
+        if message.forward_sender_name:
+            name_lower = message.forward_sender_name.lower()
+            if "postbot" in name_lower or "post bot" in name_lower:
+                warnings.append("⚠️ @PostBot orqali forward — asl manba ataylab yashirilgan")
+            # Brend taqlid in sender name
+            for brand in ALL_BRANDS:
+                if brand in name_lower:
+                    warnings.append(f"⚠️ Forward yuboruvchi nomi `{brand}` brendini taqlid qilishi mumkin")
+                    break
+
+        if message.forward_from_chat:
+            title = (message.forward_from_chat.title or "").lower()
+            # Cyrillic brend nomlari (КАПИТАЛ, ХУМО va h.k.)
+            for brand in ALL_BRANDS:
+                if brand in title:
+                    tag = "🇺🇿" if brand in UZBEK_BRANDS else "🌐"
+                    warnings.append(
+                        f"⚠️ {tag} Forward kanal/guruh nomi `{brand}` brendini taqlid qilishi mumkin"
+                    )
+                    break
+            # Tasdiqlanmagan kanal
+            if not message.forward_from_chat.username:
+                warnings.append("⚠️ Forward manba — nomi yo'q yashirin kanal")
+
+    # Inline tugma matni tekshiruvi
+    if message.reply_markup and hasattr(message.reply_markup, "inline_keyboard"):
+        for row in message.reply_markup.inline_keyboard:
+            for btn in row:
+                if btn.text:
+                    btn_lower = btn.text.lower()
+                    found = [kw for kw in SCAM_BUTTON_WORDS if kw in btn_lower]
+                    if found:
+                        warnings.append(
+                            f"⚠️ Tugma matni ijtimoiy muhandislik: '{btn.text}'"
+                        )
+
+    return warnings
+
 
 # ── Xavf hisoblash ──────────────────────────────────────────────────────────
 
@@ -293,6 +366,7 @@ def calculate_risk(
     ssl_info: dict, whois_info: dict, redirected: bool,
     vt: dict, urlhaus: dict, abuse: dict,
     pattern_w: list, brand_w: list, homograph_w: list,
+    tg_url_w: list = None, context_w: list = None,
 ) -> tuple[int, list[str]]:
     score = 0
     reasons = []
@@ -317,6 +391,16 @@ def calculate_risk(
     if brand_w:
         score += 25
         reasons.extend(brand_w)
+
+    # Telegram havola ichida brend taqlid
+    if tg_url_w:
+        score += 30
+        reasons.extend(tg_url_w)
+
+    # Xabar konteksti: forward, tugma matni
+    if context_w:
+        score += min(len(context_w) * 15, 35)
+        reasons.extend(context_w)
 
     tld = "." + domain.split(".")[-1].lower()
     if tld in SUSPICIOUS_TLDS:
@@ -373,7 +457,7 @@ def format_age(days: int | None) -> str:
 
 # ── Asosiy tahlil (parallel) ────────────────────────────────────────────────
 
-async def analyze_url(url: str) -> tuple[str, int]:
+async def analyze_url(url: str, context_w: list = None) -> tuple[str, int]:
     loop = asyncio.get_event_loop()
 
     try:
@@ -393,6 +477,7 @@ async def analyze_url(url: str) -> tuple[str, int]:
         pattern_w = check_url_patterns(final_url, domain)
         brand_w = check_brand_impersonation(domain)
         homograph_w = check_homograph(domain)
+        tg_url_w = check_telegram_url(final_url)
 
         # 3. DNS
         try:
@@ -427,7 +512,9 @@ async def analyze_url(url: str) -> tuple[str, int]:
 
         score, reasons = calculate_risk(
             domain, country, ssl_info, whois_info, redirected,
-            vt, urlhaus, abuse, pattern_w, brand_w, homograph_w
+            vt, urlhaus, abuse, pattern_w, brand_w, homograph_w,
+            tg_url_w=tg_url_w,
+            context_w=context_w or [],
         )
         label = risk_label(score)
 
@@ -556,18 +643,31 @@ async def handle_message(message: types.Message):
                 if btn.url:
                     urls_to_check.add(btn.url)
 
+    # Xabar kontekstini tahlil qilamiz (forward, tugma matni)
+    context_w = check_message_context(message)
+
+    # Havolalar yo'q bo'lsa ham kontekst xavfli bo'lishi mumkin
     if not urls_to_check:
-        await message.reply("⚠️ Ushbu xabarda hech qanday havola yoki yashirin tugma topilmadi.")
+        if context_w:
+            ctx_text = (
+                "🚨 *Kiberxavfsizlik ogohlantirishlari:*\n\n"
+                "🔗 Xabarda havola topilmadi, lekin shubhali belgilar aniqlandi:\n\n"
+                + "\n".join(context_w)
+                + "\n\n⚠️ _Bu xabarga ishonmang va ulashma!_"
+            )
+            await message.reply(ctx_text, parse_mode="Markdown")
+        else:
+            await message.reply("⚠️ Ushbu xabarda hech qanday havola yoki yashirin tugma topilmadi.")
         return
 
     await message.reply(
         f"⏳ *{len(urls_to_check)} ta havola tahlil qilinmoqda...*\n"
-        f"_(VirusTotal, PhishTank, AbuseIPDB, SSL, WHOIS parallel tekshirilmoqda)_",
+        f"_(VirusTotal, URLhaus, AbuseIPDB, SSL, WHOIS parallel tekshirilmoqda)_",
         parse_mode="Markdown",
     )
 
     for url in urls_to_check:
-        result, score = await analyze_url(url)
+        result, score = await analyze_url(url, context_w=context_w)
         if result:
             save_stat(url, score)
             text_out = (
