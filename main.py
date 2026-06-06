@@ -164,7 +164,7 @@ def check_ssl(domain: str) -> dict:
             s.connect((domain, 443))
             cert = s.getpeercert()
         expire = datetime.datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
-        days_left = (expire - datetime.datetime.utcnow()).days
+        days_left = (expire.replace(tzinfo=datetime.timezone.utc) - datetime.datetime.now(datetime.timezone.utc)).days
         issuer = dict(x[0] for x in cert.get("issuer", []))
         return {
             "valid": True,
@@ -183,7 +183,9 @@ def check_whois(domain: str) -> dict:
         if created:
             if isinstance(created, str):
                 created = datetime.datetime.fromisoformat(created)
-            age = (datetime.datetime.utcnow() - created).days
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=datetime.timezone.utc)
+            age = (datetime.datetime.now(datetime.timezone.utc) - created).days
             return {"age_days": age, "registrar": w.registrar or "Noma'lum"}
     except Exception:
         pass
