@@ -28,17 +28,28 @@ TG_API_ID   = int(_tg_id_str) if _tg_id_str.isdigit() else 0
 TG_API_HASH = os.getenv("TELETHON_API_HASH", "").strip()
 TG_SESSION  = os.getenv("TELETHON_SESSION", "").strip()
 
+# Session fayl nomi (kengaytmasiz)
+SESSION_FILE = "userbot_session"
+
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 
 # Userbot — mavjud bo'lsa ulanadi, bo'lmasa botga ta'sir qilmaydi
+# 1-usul: userbot_session.session fayli papkada bo'lsa — avtomatik ishlatiladi
+# 2-usul: .env da TELETHON_SESSION string bo'lsa — u ishlatiladi
 userbot: TelegramClient | None = None
-if TG_API_ID and TG_API_HASH and TG_SESSION:
+if TG_API_ID and TG_API_HASH:
     try:
-        userbot = TelegramClient(
-            StringSession(TG_SESSION), TG_API_ID, TG_API_HASH
-        )
-        print("[OK] Userbot sozlandi.")
+        if os.path.exists(f"{SESSION_FILE}.session"):
+            # Fayl sessiyasi — eng qulay usul
+            userbot = TelegramClient(SESSION_FILE, TG_API_ID, TG_API_HASH)
+            print(f"[OK] Userbot sessiya fayli topildi: {SESSION_FILE}.session")
+        elif TG_SESSION:
+            # String sessiya — .env dan
+            userbot = TelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH)
+            print("[OK] Userbot string sessiyasi sozlandi.")
+        else:
+            print("[!] Userbot: TELETHON_API_ID/HASH bor, lekin sessiya topilmadi.")
     except Exception as _ub_err:
         print(f"[!] Userbot ixtiyoriy — o'tkazib yuborildi: {_ub_err}")
         userbot = None
