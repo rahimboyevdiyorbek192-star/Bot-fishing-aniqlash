@@ -300,7 +300,6 @@ def check_telegram_url(url: str) -> list[str]:
         return warnings
     path = parsed.path.strip("/").lower().replace("_", "").replace("-", "")
     if not path or path.startswith("+"):
-        # t.me/+xxx — yopiq kanal invite havolasi, shubhali
         if path.startswith("+"):
             warnings.append("⚠️ Yopiq Telegram kanal taklifi — ehtiyot bo'ling")
         return warnings
@@ -309,9 +308,60 @@ def check_telegram_url(url: str) -> list[str]:
         if brand_clean in path:
             tag = "🇺🇿" if brand in UZBEK_BRANDS else "🌐"
             warnings.append(
-                f"⚠️ {tag} Telegram havola `{brand}` brendini taqlid qilishi mumkin: `t.me/{parsed.path.strip('/')}`"
+                f"⚠️ {tag} Telegram username `{brand}` brendini taqlid qilishi mumkin: `t.me/{parsed.path.strip('/')}`"
             )
     return warnings
+
+async def check_telegram_channel(url: str) -> dict:
+    """Telegram Bot API orqali kanal/bot haqida haqiqiy ma'lumot oladi."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.netloc not in TELEGRAM_DOMAINS:
+        return {}
+
+    path = parsed.path.strip("/")
+    if not path:
+        return {}
+
+    # Yopiq kanal taklifi (t.me/+xxx)
+    if path.startswith("+"):
+        return {"is_private_invite": True}
+
+    # Username olish (start parametrlarini tashlaymiz)
+    username = path.split("?")[0].split("/")[0]
+    if not username:
+        return {}
+
+    try:
+        chat = await bot.get_chat(f"@{username}")
+        title = chat.title or getattr(chat, "full_name", "") or ""
+        description = chat.description or ""
+
+        # Kanal nomida brend taqlid tekshiruvi
+        title_lower = title.lower().replace(" ", "").replace("_", "").replace("-", "")
+        title_homograph = any(
+            any(s in unicodedata.name(ch, "") for s in ("CYRILLIC", "GREEK"))
+            for ch in title if ch.isalpha()
+        )
+
+        brand_in_title = []
+        for brand in ALL_BRANDS:
+            brand_clean = brand.replace("_", "").replace("-", "")
+            if brand_clean in title_lower:
+                brand_in_title.append(brand)
+
+        return {
+            "found": True,
+            "chat_type": chat.type,
+            "title": title,
+            "username": chat.username or username,
+            "verified": getattr(chat, "is_verified", False),
+            "member_count": getattr(chat, "member_count", None),
+            "description": description[:200],
+            "brand_in_title": brand_in_title,
+            "title_has_homograph": title_homograph,
+        }
+    except Exception:
+        return {"found": False}
 
 def check_message_context(message: types.Message) -> list[str]:
     """Xabar tuzilmasidan fishing belgilarini topadi (forward, tugma matnlari)."""
@@ -479,6 +529,31 @@ async def analyze_url(url: str, context_w: list = None) -> tuple[str, int]:
         homograph_w = check_homograph(domain)
         tg_url_w = check_telegram_url(final_url)
 
+        # 2a. t.me havolasi — Telegram API orqali kanal ma'lumotlarini olish
+        is_telegram_link = domain in TELEGRAM_DOMAINS
+        tg_channel = {}
+        if is_telegram_link:
+            tg_channel = await check_telegram_channel(final_url)
+
+        # t.me kanali uchun qo'shimcha ogohlantirish
+        tg_channel_w = []
+        if tg_channel.get("found"):
+            ch_title = tg_channel.get("title", "")
+            # Tasdiqlangan emas + brendni taqlid qiladi
+            if tg_channel.get("brand_in_title") and not tg_channel.get("verified"):
+                for brand in tg_channel["brand_in_title"]:
+                    tag = "🇺🇿" if brand in UZBEK_BRANDS else "🌐"
+                    tg_channel_w.append(
+                        f"🔴 {tag} Kanal `{brand}` brendini taqlid qiladi lekin TASDIQLANMAGAN!"
+                    )
+            # Kanal nomida kirill/unicode harflar
+            if tg_channel.get("title_has_homograph"):
+                tg_channel_w.append(
+                    f"🔴 Kanal nomida unicode harflar — homograf hujum: `{ch_title}`"
+                )
+        elif tg_channel.get("is_private_invite"):
+            tg_channel_w.append("⚠️ Yopiq Telegram kanal taklifi — kim ekanligini ko'rib bo'lmaydi")
+
         # 3. DNS
         try:
             ip = await loop.run_in_executor(executor, socket.gethostbyname, domain)
@@ -510,10 +585,11 @@ async def analyze_url(url: str, context_w: list = None) -> tuple[str, int]:
         isp     = geo.get("isp", "Noma'lum")
         org     = geo.get("org", "Noma'lum")
 
+        all_tg_w = tg_url_w + tg_channel_w
         score, reasons = calculate_risk(
             domain, country, ssl_info, whois_info, redirected,
             vt, urlhaus, abuse, pattern_w, brand_w, homograph_w,
-            tg_url_w=tg_url_w,
+            tg_url_w=all_tg_w,
             context_w=context_w or [],
         )
         label = risk_label(score)
@@ -531,6 +607,25 @@ async def analyze_url(url: str, context_w: list = None) -> tuple[str, int]:
                 chain_lines += f"  {prefix} `{hop[:80]}`\n"
         else:
             chain_lines = "🔗 *Yo'naltirish:* Yo'q"
+
+        # Telegram kanal bloki
+        if tg_channel.get("found"):
+            verified_str = "✅ Tasdiqlangan" if tg_channel.get("verified") else "❌ Tasdiqlanmagan"
+            members = tg_channel.get("member_count")
+            members_str = f"{members:,}" if members else "Noma'lum"
+            tg_block = (
+                f"\n📱 *Telegram kanal ma'lumoti:*\n"
+                f"📛 *Nomi:* {tg_channel.get('title', '—')}\n"
+                f"🔖 *Username:* @{tg_channel.get('username', '—')}\n"
+                f"✅ *Tasdiqlangan:* {verified_str}\n"
+                f"👥 *A'zolar:* {members_str}\n"
+            )
+        elif tg_channel.get("is_private_invite"):
+            tg_block = "\n📱 *Telegram:* Yopiq kanal taklifi\n"
+        elif is_telegram_link:
+            tg_block = "\n📱 *Telegram:* Kanal topilmadi\n"
+        else:
+            tg_block = ""
 
         if vt.get("available"):
             if vt.get("pending"):
@@ -564,8 +659,10 @@ async def analyze_url(url: str, context_w: list = None) -> tuple[str, int]:
             f"🏢 *Hosting:* {isp}\n"
             f"🔒 *Tashkilot:* {org}\n"
             f"🛡 *SSL:* {ssl_str}\n"
-            f"📅 *Domen yoshi:* {format_age(whois_info.get('age_days'))} · {whois_info.get('registrar', 'Noma''lum')}\n"
-            f"{chain_lines}\n\n"
+            f"📅 *Domen yoshi:* {format_age(whois_info.get('age_days'))} · "
+            f"{whois_info.get('registrar', 'Noma''lum')}\n"
+            f"{chain_lines}"
+            f"{tg_block}\n"
             f"*🔬 Threat Intelligence:*\n"
             f"🦠 *VirusTotal:* {vt_str}\n"
             f"☣️ *URLhaus:* {uh_str}\n"
