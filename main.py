@@ -645,15 +645,37 @@ async def analyze_url(url: str, context_w: list = None) -> tuple[str, int]:
         browser    = safe(results[6], {"available": False})
 
         # Brauzer redirect yangi domenni topsa — uni ham tahlil qilamiz
+        # Brauzer haqiqiy domen topsa — uning IP, geo, VT, URLhaus tekshiruvlari
+        real_domain = ""
+        real_ip = ""
+        real_geo = {}
+        real_vt = {"available": False}
+        real_urlhaus = {"available": False}
+
         if browser.get("available") and browser.get("redirected"):
             real_url = browser.get("final_url", "")
             real_parsed = urllib.parse.urlparse(real_url)
             real_domain = (real_parsed.netloc or real_parsed.path).split(":")[0]
             if real_domain and real_domain != domain:
-                # Yangi domen uchun geo va risk belgilari
                 brand_w += check_brand_impersonation(real_domain)
                 homograph_w += check_homograph(real_domain)
                 tg_url_w += check_telegram_url(real_url)
+
+                # Haqiqiy domenning IP, geo, VT, URLhaus ni PARALLEL olamiz
+                try:
+                    real_ip = await loop.run_in_executor(executor, socket.gethostbyname, real_domain)
+                except Exception:
+                    real_ip = "Noma'lum"
+
+                real_results = await asyncio.gather(
+                    loop.run_in_executor(executor, _get_geo, real_ip),
+                    loop.run_in_executor(executor, check_virustotal, real_url),
+                    loop.run_in_executor(executor, check_urlhaus, real_url),
+                    return_exceptions=True,
+                )
+                real_geo     = safe(real_results[0], {})
+                real_vt      = safe(real_results[1], {"available": False})
+                real_urlhaus = safe(real_results[2], {"available": False})
 
         country = geo.get("country", "Noma'lum")
         isp     = geo.get("isp", "Noma'lum")
@@ -752,14 +774,40 @@ async def analyze_url(url: str, context_w: list = None) -> tuple[str, int]:
             b_title = browser.get("title", "—")
             b_card  = "🔴 BOR" if browser.get("has_card_input") else "🟢 Yo'q"
             b_pass  = "🔴 BOR" if browser.get("has_password") else "🟢 Yo'q"
-            b_redir = f"🔀 `{b_final[:80]}`" if browser.get("redirected") else "✅ Yo'q"
-            browser_block = (
-                f"\n🌐 *Brauzer tekshiruvi:*\n"
-                f"📄 *Sahifa nomi:* {b_title}\n"
-                f"🔀 *Haqiqiy manzil:* {b_redir}\n"
-                f"💳 *Karta shakli:* {b_card}\n"
-                f"🔑 *Parol shakli:* {b_pass}\n"
-            )
+
+            if browser.get("redirected") and real_domain and real_domain != domain:
+                r_country = real_geo.get("country", "Noma'lum")
+                r_isp     = real_geo.get("isp", "Noma'lum")
+
+                # Haqiqiy URL uchun VT/URLhaus qisqa natija
+                if real_vt.get("available") and not real_vt.get("pending"):
+                    r_vt = f"{'🔴' if real_vt['malicious'] > 0 else '🟢'} {real_vt['malicious']}/{real_vt['total']}"
+                else:
+                    r_vt = "⚪"
+                if real_urlhaus.get("available"):
+                    r_uh = "🔴 Topildi" if real_urlhaus.get("found") else "🟢 Yo'q"
+                else:
+                    r_uh = "⚪"
+
+                browser_block = (
+                    f"\n🌐 *Brauzer tekshiruvi — HAQIQIY MANZIL:*\n"
+                    f"🔀 *URL:* `{b_final[:80]}`\n"
+                    f"📄 *Sahifa nomi:* {b_title}\n"
+                    f"🌐 *Domen:* `{real_domain}`\n"
+                    f"📌 *IP:* `{real_ip}` · {r_country}\n"
+                    f"🏢 *Hosting:* {r_isp}\n"
+                    f"🦠 *VT:* {r_vt} · ☣️ *URLhaus:* {r_uh}\n"
+                    f"💳 *Karta shakli:* {b_card}\n"
+                    f"🔑 *Parol shakli:* {b_pass}\n"
+                )
+            else:
+                browser_block = (
+                    f"\n🌐 *Brauzer tekshiruvi:*\n"
+                    f"📄 *Sahifa nomi:* {b_title}\n"
+                    f"🔀 *Yo'naltirish:* Yo'q\n"
+                    f"💳 *Karta shakli:* {b_card}\n"
+                    f"🔑 *Parol shakli:* {b_pass}\n"
+                )
         else:
             browser_block = "\n🌐 *Brauzer:* playwright o'rnatilmagan\n"
 
