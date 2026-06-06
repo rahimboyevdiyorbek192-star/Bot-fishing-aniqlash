@@ -22,19 +22,26 @@ load_dotenv()
 BOT_TOKEN        = os.getenv("BOT_TOKEN")
 VT_API_KEY       = os.getenv("VIRUSTOTAL_API_KEY", "")
 ABUSEIPDB_KEY    = os.getenv("ABUSEIPDB_API_KEY", "")
-TG_API_ID        = int(os.getenv("TELETHON_API_ID", "0"))
-TG_API_HASH      = os.getenv("TELETHON_API_HASH", "")
-TG_SESSION       = os.getenv("TELETHON_SESSION", "")
+
+_tg_id_str = os.getenv("TELETHON_API_ID", "").strip()
+TG_API_ID   = int(_tg_id_str) if _tg_id_str.isdigit() else 0
+TG_API_HASH = os.getenv("TELETHON_API_HASH", "").strip()
+TG_SESSION  = os.getenv("TELETHON_SESSION", "").strip()
 
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 
-# Userbot — mavjud bo'lsa ulanadi
+# Userbot — mavjud bo'lsa ulanadi, bo'lmasa botga ta'sir qilmaydi
 userbot: TelegramClient | None = None
 if TG_API_ID and TG_API_HASH and TG_SESSION:
-    userbot = TelegramClient(
-        StringSession(TG_SESSION), TG_API_ID, TG_API_HASH
-    )
+    try:
+        userbot = TelegramClient(
+            StringSession(TG_SESSION), TG_API_ID, TG_API_HASH
+        )
+        print("[OK] Userbot sozlandi.")
+    except Exception as _ub_err:
+        print(f"[!] Userbot ixtiyoriy — o'tkazib yuborildi: {_ub_err}")
+        userbot = None
 executor = ThreadPoolExecutor(max_workers=10)
 
 DB_PATH = "stats.db"
