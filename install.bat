@@ -41,6 +41,10 @@ echo.
 pip install -r requirements.txt
 
 echo.
+echo [*] Playwright brauzeri o'rnatilmoqda (bir martalik ~300MB)...
+playwright install chromium
+
+echo.
 if errorlevel 1 (
     echo [XATO] O'rnatishda xatolik yuz berdi!
 ) else (

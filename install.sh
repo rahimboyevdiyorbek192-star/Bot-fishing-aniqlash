@@ -34,6 +34,10 @@ echo "[*] Kutubxonalar o'rnatilmoqda..."
 pip3 install -r requirements.txt
 
 echo
+echo "[*] Playwright brauzeri o'rnatilmoqda (bir martalik ~300MB)..."
+playwright install chromium
+
+echo
 if [ $? -eq 0 ]; then
     echo "===================================="
     echo " O'rnatish muvaffaqiyatli tugadi!"

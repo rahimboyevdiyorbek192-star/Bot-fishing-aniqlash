@@ -234,6 +234,55 @@ def check_abuseipdb(ip: str) -> dict:
     except Exception:
         return {"available": False}
 
+async def check_with_browser(url: str) -> dict:
+    """Headless Chromium orqali URL ni ochib, haqiqiy manzil va sahifa ma'lumotlarini oladi."""
+    try:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            ctx = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                )
+            )
+            page = await ctx.new_page()
+
+            try:
+                await page.goto(url, wait_until="networkidle", timeout=15000)
+            except Exception:
+                # networkidle kutmasa ham sahifa ochilgan bo'lishi mumkin
+                pass
+
+            final_url = page.url
+            title = await page.title()
+
+            # Shubhali shakllar bor-yo'qligini tekshiramiz
+            has_password  = await page.locator("input[type='password']").count() > 0
+            has_card_input = await page.locator(
+                "input[name*='card'], input[placeholder*='card'], "
+                "input[placeholder*='karta'], input[name*='pan'], "
+                "input[maxlength='16'], input[maxlength='19']"
+            ).count() > 0
+            has_form = await page.locator("form").count() > 0
+
+            await browser.close()
+
+            return {
+                "available": True,
+                "final_url": final_url,
+                "title": title[:120],
+                "redirected": final_url.rstrip("/") != url.rstrip("/"),
+                "has_password": has_password,
+                "has_card_input": has_card_input,
+                "has_form": has_form,
+            }
+    except ImportError:
+        return {"available": False, "error": "playwright o'rnatilmagan"}
+    except Exception as e:
+        return {"available": False, "error": str(e)[:100]}
+
 
 # ── Heuristik tekshiruvlar ──────────────────────────────────────────────────
 
@@ -572,7 +621,7 @@ async def analyze_url(url: str, context_w: list = None) -> tuple[str, int]:
         except Exception:
             ip = "Noma'lum"
 
-        # 4. Barcha tarmoq tekshiruvlari PARALLEL
+        # 4. Barcha tarmoq tekshiruvlari + brauzer tekshiruvi PARALLEL
         results = await asyncio.gather(
             loop.run_in_executor(executor, _get_geo, ip),
             loop.run_in_executor(executor, check_ssl, domain),
@@ -580,6 +629,7 @@ async def analyze_url(url: str, context_w: list = None) -> tuple[str, int]:
             loop.run_in_executor(executor, check_virustotal, final_url),
             loop.run_in_executor(executor, check_urlhaus, final_url),
             loop.run_in_executor(executor, check_abuseipdb, ip),
+            check_with_browser(final_url),
             return_exceptions=True,
         )
 
@@ -589,20 +639,44 @@ async def analyze_url(url: str, context_w: list = None) -> tuple[str, int]:
         geo        = safe(results[0], {})
         ssl_info   = safe(results[1], {"valid": False, "days_left": 0, "issuer": "Noma'lum"})
         whois_info = safe(results[2], {"age_days": None, "registrar": "Noma'lum"})
-        vt      = safe(results[3], {"available": False})
-        urlhaus = safe(results[4], {"available": False})
-        abuse   = safe(results[5], {"available": False})
+        vt         = safe(results[3], {"available": False})
+        urlhaus    = safe(results[4], {"available": False})
+        abuse      = safe(results[5], {"available": False})
+        browser    = safe(results[6], {"available": False})
+
+        # Brauzer redirect yangi domenni topsa — uni ham tahlil qilamiz
+        if browser.get("available") and browser.get("redirected"):
+            real_url = browser.get("final_url", "")
+            real_parsed = urllib.parse.urlparse(real_url)
+            real_domain = (real_parsed.netloc or real_parsed.path).split(":")[0]
+            if real_domain and real_domain != domain:
+                # Yangi domen uchun geo va risk belgilari
+                brand_w += check_brand_impersonation(real_domain)
+                homograph_w += check_homograph(real_domain)
+                tg_url_w += check_telegram_url(real_url)
 
         country = geo.get("country", "Noma'lum")
         isp     = geo.get("isp", "Noma'lum")
         org     = geo.get("org", "Noma'lum")
+
+        # Brauzer tekshiruvi natijasini risk ogohlantirishlariga qo'shamiz
+        browser_w = []
+        if browser.get("available"):
+            if browser.get("has_card_input"):
+                browser_w.append("🔴 Sahifada karta raqami kiritish shakli topildi!")
+            if browser.get("has_password"):
+                browser_w.append("🔴 Sahifada parol kiritish shakli topildi!")
+            if browser.get("has_form") and not browser.get("has_card_input") and not browser.get("has_password"):
+                browser_w.append("⚠️ Sahifada ma'lumot kiritish shakli bor")
+            if browser.get("redirected"):
+                browser_w.append(f"🔀 Brauzer haqiqiy manzilga o'tkazdi: `{browser.get('final_url', '')[:80]}`")
 
         all_tg_w = tg_url_w + tg_channel_w
         score, reasons = calculate_risk(
             domain, country, ssl_info, whois_info, redirected,
             vt, urlhaus, abuse, pattern_w, brand_w, homograph_w,
             tg_url_w=all_tg_w,
-            context_w=context_w or [],
+            context_w=(context_w or []) + browser_w,
         )
         label = risk_label(score)
 
@@ -672,6 +746,23 @@ async def analyze_url(url: str, context_w: list = None) -> tuple[str, int]:
         else:
             abuse_str = "⚪ API kalit yo'q"
 
+        # Brauzer natijasi bloki
+        if browser.get("available"):
+            b_final = browser.get("final_url", final_url)
+            b_title = browser.get("title", "—")
+            b_card  = "🔴 BOR" if browser.get("has_card_input") else "🟢 Yo'q"
+            b_pass  = "🔴 BOR" if browser.get("has_password") else "🟢 Yo'q"
+            b_redir = f"🔀 `{b_final[:80]}`" if browser.get("redirected") else "✅ Yo'q"
+            browser_block = (
+                f"\n🌐 *Brauzer tekshiruvi:*\n"
+                f"📄 *Sahifa nomi:* {b_title}\n"
+                f"🔀 *Haqiqiy manzil:* {b_redir}\n"
+                f"💳 *Karta shakli:* {b_card}\n"
+                f"🔑 *Parol shakli:* {b_pass}\n"
+            )
+        else:
+            browser_block = "\n🌐 *Brauzer:* playwright o'rnatilmagan\n"
+
         report = (
             f"🔍 *Havola tahlili:*\n"
             f"🌐 *Domen:* `{domain}`\n"
@@ -682,7 +773,8 @@ async def analyze_url(url: str, context_w: list = None) -> tuple[str, int]:
             f"📅 *Domen yoshi:* {format_age(whois_info.get('age_days'))} · "
             f"{whois_info.get('registrar', 'Noma''lum')}\n"
             f"{chain_lines}"
-            f"{tg_block}\n"
+            f"{tg_block}"
+            f"{browser_block}\n"
             f"*🔬 Threat Intelligence:*\n"
             f"🦠 *VirusTotal:* {vt_str}\n"
             f"☣️ *URLhaus:* {uh_str}\n"
