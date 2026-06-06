@@ -20,7 +20,6 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 VT_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
 ABUSEIPDB_KEY = os.getenv("ABUSEIPDB_API_KEY", "")
-PHISHTANK_KEY = os.getenv("PHISHTANK_API_KEY", "")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -189,23 +188,23 @@ def check_virustotal(url: str) -> dict:
         pass
     return {"available": False}
 
-def check_phishtank(url: str) -> dict:
+def check_urlhaus(url: str) -> dict:
+    """URLhaus (abuse.ch) — malware/phishing URL bazasi. API kalit shart emas."""
     try:
-        data = {"url": url, "format": "json"}
-        if PHISHTANK_KEY:
-            data["app_key"] = PHISHTANK_KEY
         resp = requests.post(
-            "https://checkurl.phishtank.com/checkurl/",
-            data=data,
-            headers={"User-Agent": "phishtank/python"},
+            "https://urlhaus-api.abuse.ch/v1/url/",
+            data={"url": url},
             timeout=10
-        )
-        result = resp.json().get("results", {})
-        return {
-            "available": True,
-            "in_database": result.get("in_database", False),
-            "is_phishing": result.get("valid", False),
-        }
+        ).json()
+        status = resp.get("query_status", "")
+        if status == "is_available":
+            return {
+                "available": True,
+                "found": True,
+                "threat": resp.get("threat", "malware"),
+                "tags": resp.get("tags") or [],
+            }
+        return {"available": True, "found": False, "threat": "", "tags": []}
     except Exception:
         return {"available": False}
 
@@ -292,7 +291,7 @@ def check_homograph(domain: str) -> list[str]:
 def calculate_risk(
     domain: str, country: str,
     ssl_info: dict, whois_info: dict, redirected: bool,
-    vt: dict, phishtank: dict, abuse: dict,
+    vt: dict, urlhaus: dict, abuse: dict,
     pattern_w: list, brand_w: list, homograph_w: list,
 ) -> tuple[int, list[str]]:
     score = 0
@@ -302,9 +301,10 @@ def calculate_risk(
         score += min(vt["malicious"] * 5, 40)
         reasons.append(f"🔴 VirusTotal: {vt['malicious']}/{vt['total']} engine xavfli dedi")
 
-    if phishtank.get("is_phishing"):
+    if urlhaus.get("found"):
         score += 40
-        reasons.append("🔴 PhishTank: tasdiqlangan phishing sayt!")
+        threat = urlhaus.get("threat", "malware")
+        reasons.append(f"🔴 URLhaus: bazada topildi — `{threat}`")
 
     if abuse.get("available") and abuse.get("abuse_score", 0) > 25:
         score += min(abuse["abuse_score"] // 4, 20)
@@ -406,7 +406,7 @@ async def analyze_url(url: str) -> tuple[str, int]:
             loop.run_in_executor(executor, check_ssl, domain),
             loop.run_in_executor(executor, check_whois, domain),
             loop.run_in_executor(executor, check_virustotal, final_url),
-            loop.run_in_executor(executor, check_phishtank, final_url),
+            loop.run_in_executor(executor, check_urlhaus, final_url),
             loop.run_in_executor(executor, check_abuseipdb, ip),
             return_exceptions=True,
         )
@@ -417,9 +417,9 @@ async def analyze_url(url: str) -> tuple[str, int]:
         geo        = safe(results[0], {})
         ssl_info   = safe(results[1], {"valid": False, "days_left": 0, "issuer": "Noma'lum"})
         whois_info = safe(results[2], {"age_days": None, "registrar": "Noma'lum"})
-        vt         = safe(results[3], {"available": False})
-        phishtank  = safe(results[4], {"available": False})
-        abuse      = safe(results[5], {"available": False})
+        vt      = safe(results[3], {"available": False})
+        urlhaus = safe(results[4], {"available": False})
+        abuse   = safe(results[5], {"available": False})
 
         country = geo.get("country", "Noma'lum")
         isp     = geo.get("isp", "Noma'lum")
@@ -427,7 +427,7 @@ async def analyze_url(url: str) -> tuple[str, int]:
 
         score, reasons = calculate_risk(
             domain, country, ssl_info, whois_info, redirected,
-            vt, phishtank, abuse, pattern_w, brand_w, homograph_w
+            vt, urlhaus, abuse, pattern_w, brand_w, homograph_w
         )
         label = risk_label(score)
 
@@ -454,15 +454,14 @@ async def analyze_url(url: str) -> tuple[str, int]:
         else:
             vt_str = "⚪ API kalit yo'q"
 
-        if phishtank.get("available"):
-            if phishtank.get("is_phishing"):
-                pt_str = "🔴 Tasdiqlangan phishing sayt!"
-            elif phishtank.get("in_database"):
-                pt_str = "🟡 Bazada bor, tasdiqlanmagan"
+        if urlhaus.get("available"):
+            if urlhaus.get("found"):
+                tags = ", ".join(urlhaus.get("tags", [])[:3])
+                uh_str = f"🔴 Bazada topildi! ({urlhaus.get('threat', 'malware')}{' · ' + tags if tags else ''})"
             else:
-                pt_str = "🟢 Phishing bazasida yo'q"
+                uh_str = "🟢 URLhaus bazasida yo'q"
         else:
-            pt_str = "⚪ Tekshirib bo'lmadi"
+            uh_str = "⚪ Tekshirib bo'lmadi"
 
         if abuse.get("available"):
             s = abuse.get("abuse_score", 0)
@@ -478,11 +477,11 @@ async def analyze_url(url: str) -> tuple[str, int]:
             f"🏢 *Hosting:* {isp}\n"
             f"🔒 *Tashkilot:* {org}\n"
             f"🛡 *SSL:* {ssl_str}\n"
-            f"📅 *Domen yoshi:* {format_age(whois_info.get('age_days'))} · {whois_info.get('registrar', 'Noma\\'lum')}\n"
+            f"📅 *Domen yoshi:* {format_age(whois_info.get('age_days'))} · {whois_info.get('registrar', 'Noma''lum')}\n"
             f"{chain_lines}\n\n"
             f"*🔬 Threat Intelligence:*\n"
             f"🦠 *VirusTotal:* {vt_str}\n"
-            f"🎣 *PhishTank:* {pt_str}\n"
+            f"☣️ *URLhaus:* {uh_str}\n"
             f"🚨 *AbuseIPDB:* {abuse_str}\n\n"
             f"📊 *Xavf darajasi: {score}/100 — {label}*"
         )
@@ -507,7 +506,7 @@ async def cmd_start(message: types.Message):
         "Telegram xabarlaridagi havolalarni professional darajada tahlil qiladi.\n\n"
         "*Bot nima tekshiradi?*\n"
         "🦠 VirusTotal — 70+ antivirus bazasi\n"
-        "🎣 PhishTank — tasdiqlangan phishing bazasi\n"
+        "☣️ URLhaus — malware/phishing URL bazasi (abuse.ch)\n"
         "🚨 AbuseIPDB — spam/hujum IP bazasi\n"
         "🛡 SSL sertifikat holati va muddati\n"
         "📅 Domen yoshi (WHOIS)\n"
