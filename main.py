@@ -267,7 +267,7 @@ def check_abuseipdb(ip: str) -> dict:
         return {"available": False}
 
 async def probe_telegram_bot(username: str) -> dict:
-    """Userbot orqali shubhali botga /start yuborib, javobidagi havolalarni oladi."""
+    """Userbot orqali shubhali botga /start yuborib, callback tugmalarni bosib, havolalarni oladi."""
     if not userbot:
         return {"available": False}
     try:
@@ -275,36 +275,27 @@ async def probe_telegram_bot(username: str) -> dict:
 
         # /start yuboramiz
         await userbot.send_message(entity, "/start")
-
-        # 5 sekund javob kutamiz
         await asyncio.sleep(5)
 
-        # Bot yuborgan so'nggi xabarlarni olamiz
         messages = await userbot.get_messages(entity, limit=8)
 
         urls: set[str] = set()
         texts: list[str] = []
+        clicked_buttons: list[str] = []
+        last_msg_id = 0
 
-        for msg in messages:
-            if msg.out:           # o'zimiz yuborganimizni o'tkazib yuboramiz
-                continue
-            if msg.text:
-                texts.append(msg.text[:300])
-
-            # Matn entities dan URL lar
+        def _extract(msg):
             if msg.entities:
                 for ent in msg.entities:
                     if hasattr(ent, "url") and ent.url:
                         urls.add(ent.url)
                     elif hasattr(ent, "offset") and msg.text:
                         try:
-                            chunk = msg.text[ent.offset : ent.offset + ent.length]
+                            chunk = msg.text[ent.offset: ent.offset + ent.length]
                             if chunk.startswith("http"):
                                 urls.add(chunk)
                         except Exception:
                             pass
-
-            # Inline tugma havolalari
             if msg.buttons:
                 for row in msg.buttons:
                     if not isinstance(row, (list, tuple)):
@@ -313,11 +304,53 @@ async def probe_telegram_bot(username: str) -> dict:
                         if hasattr(btn, "url") and btn.url:
                             urls.add(btn.url)
 
+        for msg in messages:
+            if msg.out:
+                continue
+            if msg.text:
+                texts.append(msg.text[:300])
+            _extract(msg)
+            if msg.id > last_msg_id:
+                last_msg_id = msg.id
+
+        # Callback tugmalarni bosamiz (URL tugmalar allaqachon olindi)
+        for msg in messages:
+            if msg.out or not msg.buttons:
+                continue
+            for row in msg.buttons:
+                if not isinstance(row, (list, tuple)):
+                    row = [row]
+                for btn in row:
+                    # URL tugma → allaqachon olgannmiz
+                    if hasattr(btn, "url") and btn.url:
+                        continue
+                    btn_text = getattr(btn, "text", "") or ""
+                    # Maksimal 4 ta tugma bosamiz (spam bo'lmasin)
+                    if len(clicked_buttons) >= 4:
+                        break
+                    try:
+                        await btn.click()
+                        clicked_buttons.append(btn_text)
+                        await asyncio.sleep(3)
+
+                        # Tugma bosgandan keyin kelgan yangi xabarlar
+                        new_msgs = await userbot.get_messages(entity, limit=6)
+                        for nm in new_msgs:
+                            if nm.out or nm.id <= last_msg_id:
+                                continue
+                            if nm.text:
+                                texts.append(f"[{btn_text[:30]}] {nm.text[:200]}")
+                            _extract(nm)
+                            last_msg_id = max(last_msg_id, nm.id)
+                    except Exception:
+                        pass
+
         return {
             "available": True,
             "urls": list(urls),
             "msg_count": len([m for m in messages if not m.out]),
             "sample_text": texts[0][:200] if texts else "",
+            "clicked_buttons": clicked_buttons,
         }
     except Exception as e:
         return {"available": False, "error": str(e)[:150]}
@@ -845,17 +878,22 @@ async def analyze_url(url: str, context_w: list = None) -> tuple[str, int]:
         if probe.get("available"):
             msg_count = probe.get("msg_count", 0)
             sample = probe.get("sample_text", "")
+            clicked = probe.get("clicked_buttons", [])
+            clicked_str = ", ".join(f"'{b}'" for b in clicked[:4]) if clicked else "Yo'q"
             if probe_urls:
                 urls_list = "\n".join(f"  🔗 `{u[:80]}`" for u in probe_urls[:5])
                 probe_block = (
                     f"\n🤖 *Userbot tekshiruvi ({msg_count} ta javob):*\n"
+                    f"🖱 *Bosgan tugmalar:* {clicked_str}\n"
                     f"📨 *Bot matni:* {sample[:100]}\n"
                     f"🔗 *Topilgan havolalar:*\n{urls_list}\n"
                 )
             else:
                 probe_block = (
                     f"\n🤖 *Userbot tekshiruvi:* {msg_count} ta javob\n"
-                    f"📨 *Bot matni:* {sample[:100] if sample else 'Havola topilmadi'}\n"
+                    f"🖱 *Bosgan tugmalar:* {clicked_str}\n"
+                    f"📨 *Bot matni:* {sample[:100] if sample else '—'}\n"
+                    f"🔗 *Havolalar:* Topilmadi\n"
                 )
         elif userbot and is_telegram_link and not tg_channel.get("deleted"):
             probe_block = "\n🤖 *Userbot:* Botga ulanib bo'lmadi\n"
