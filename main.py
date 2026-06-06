@@ -394,7 +394,7 @@ def check_message_context(message: types.Message) -> list[str]:
             if not message.forward_from_chat.username:
                 warnings.append("⚠️ Forward manba — nomi yo'q yashirin kanal")
 
-    # Inline tugma matni tekshiruvi
+    # Inline tugma matni va WebApp tekshiruvi
     if message.reply_markup and hasattr(message.reply_markup, "inline_keyboard"):
         for row in message.reply_markup.inline_keyboard:
             for btn in row:
@@ -405,6 +405,11 @@ def check_message_context(message: types.Message) -> list[str]:
                         warnings.append(
                             f"⚠️ Tugma matni ijtimoiy muhandislik: '{btn.text}'"
                         )
+                # WebApp tugmasi — havola Telegram ichida yashiringan
+                if btn.web_app and btn.web_app.url:
+                    warnings.append(
+                        f"⚠️ WebApp tugmasi — havola yashiringan: `{btn.web_app.url[:80]}`"
+                    )
 
     return warnings
 
@@ -739,6 +744,9 @@ async def handle_message(message: types.Message):
             for btn in row:
                 if btn.url:
                     urls_to_check.add(btn.url)
+                # WebApp tugmasi — fishing saytlar shu yerda yashirinadi
+                if btn.web_app and btn.web_app.url:
+                    urls_to_check.add(btn.web_app.url)
 
     # Xabar kontekstini tahlil qilamiz (forward, tugma matni)
     context_w = check_message_context(message)
