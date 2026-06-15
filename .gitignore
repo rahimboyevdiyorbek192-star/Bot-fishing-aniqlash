@@ -1,6 +1,0 @@
-*.session
-*.session-journal
-.env
-__pycache__/
-*.pyc
-OSINT_Monitoring.xlsx
